@@ -1,1 +1,1 @@
-  {{js_name}} = {{value}};
+	{{js_name}} = {{value}};
