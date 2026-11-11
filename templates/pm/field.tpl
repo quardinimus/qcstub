@@ -1,0 +1,1 @@
+our ${{name}} = {{value}};

@@ -1,0 +1,238 @@
+#!/bin/sh
+dir=.
+tpl_root=${XDG_CONFIG_HOME:-$HOME/.config}/qcstub/templates
+NL='
+'
+
+AWK_LIB='
+BEGIN { for (k in ENVIRON) if (k ~ /^T_/) V[substr(k, 3)] = ENVIRON[k] }
+function expand(s,   out, i, j, k) {
+  while ((i = index(s, "{{")) > 0 && (j = index(substr(s, i), "}}")) > 0) {
+    k = substr(s, i + 2, j - 3)
+    if (k in V) { out = out substr(s, 1, i - 1) V[k]; s = substr(s, i + j + 1) }
+    else { out = out substr(s, 1, i + 1); s = substr(s, i + 2) }
+  }
+  return out s
+}'
+
+tpl() {
+  if [ -f "$tdir/$1" ]; then cat "$tdir/$1"; else printf '%s' "$2"; fi
+}
+
+class_name() {
+  b=${1##*/}
+  b=${b%.*}
+  printf '%s' "$b" | awk '{
+    n = split($0, p, /[-_. ]+/); out = ""
+    for (i = 1; i <= n; i++)
+      if (p[i] != "") out = out toupper(substr(p[i], 1, 1)) substr(p[i], 2)
+    print out
+  }'
+}
+
+methods() {
+  printf '%s' "$1" | awk '
+    function emit() {
+      if (tok != "") { print tok; tok = "" }
+    }
+    {
+      depth = 0; tok = ""; q = ""
+      for (i = 1; i <= length($0); i++) {
+        c = substr($0, i, 1)
+        if (q != "") {
+          if (c == "\\") { tok = tok c substr($0, ++i, 1); continue }
+          if (c == q) q = ""
+          tok = tok c
+          continue
+        }
+        if ((c == "\"" || c == "\047" || c == "`") && (tok == "" || substr(tok, length(tok)) == "=")) {
+          q = c; tok = tok c; continue
+        }
+        if (c == "(") depth++
+        if (c == ")") depth--
+        if ((c == " " || c == "\t") && depth == 0) {
+          if (tok ~ /=new$/) { tok = tok " "; continue }
+          emit(); continue
+        }
+        tok = tok c
+      }
+      emit()
+    }'
+}
+
+vars() {
+  printf '%s' "$1" | T_vt=$2 awk -F',' "$AWK_LIB"'
+    {
+      out = ""
+      for (i = 1; i <= NF; i++) {
+        v = $i
+        gsub(/^[ \t]+|[ \t]+$/, "", v)
+        if (v == "") continue
+        n = split(v, w, /[ \t]+/)
+        pre = ""
+        for (j = 1; j < n; j++) pre = pre w[j] " "
+        V["var"] = w[n]
+        out = out (out == "" ? "" : ", ") pre expand(V["vt"])
+      }
+      print out
+    }'
+}
+
+render() {
+  f=$1
+  shift
+  (
+    for kv; do export "T_$kv"; done
+    awk "$AWK_LIB"'{ print expand($0) }' "$f"
+  )
+}
+
+reset() {
+  vis=public
+  st=
+  as=
+  gen=
+}
+
+build() {
+  file=$1
+  spec=$2
+  parent=$3
+  ext=${file##*.}
+  cname=$(class_name "$file")
+  tdir=$tpl_root/$ext
+  iface=
+  case "$spec" in
+    interface|"interface "*)
+      iface=1
+      spec=${spec#interface}
+      ctpl=$tdir/interface.tpl
+      mtpl=$tdir/interface_method.tpl
+      ;;
+    *)
+      ctpl=$tdir/class.tpl
+      mtpl=$tdir/method.tpl
+      ;;
+  esac
+  if [ ! -f "$ctpl" ] || [ ! -f "$mtpl" ]; then
+    echo "no templates for .$ext in $tdir" >&2
+    return 1
+  fi
+  vt=$(tpl var.tpl '{{var}}')
+  qt=$(tpl quote.tpl "'")
+  nullv=$(tpl null.tpl null)
+  ext_str=
+  if [ -n "$parent" ]; then
+    parent=$(printf '%s' "$parent" | tr -d ' \t')
+    case "$parent" in
+      *,*)
+        if [ -n "$iface" ]; then
+          parent=$(printf '%s' "$parent" | sed 's/,/, /g')
+        else
+          echo "multiple parents, using first: ${parent%%,*}" >&2
+          parent=${parent%%,*}
+        fi
+        ;;
+    esac
+    if [ -n "$parent" ]; then
+      ext_str=$(tpl extends.tpl ' extends {{parent}}' | render - parent="$parent" class="$cname")
+    fi
+    grep -q '{{extends}}' "$ctpl" || echo "warning: $ctpl has no {{extends}}" >&2
+  fi
+  body=
+  fbody=
+  reset
+  while IFS= read -r tok; do
+    [ -n "$tok" ] || continue
+    case "$tok" in
+      public|private|protected) vis=$tok; continue ;;
+      static) st='static '; continue ;;
+      async) as='async '; continue ;;
+      \*) gen='*'; continue ;;
+    esac
+    pre=$(tpl "prefix_$vis.tpl")
+    case "${tok%%(*}" in
+      *=*)
+        if [ -n "$iface" ] || [ ! -f "$tdir/field.tpl" ]; then
+          [ -n "$iface" ] || echo "no field.tpl for .$ext, skipping: $tok" >&2
+          reset
+          continue
+        fi
+        name=${tok%%=*}
+        value=${tok#*=}
+        case "$value" in ''|null) value=$nullv ;; esac
+        case "$value" in
+          null|nil|undef|true|false|None|True|False|undefined|NaN|Infinity|new\ *|*"("*|\"*|\'*|\`*|\[*|\{*) ;;
+          *)
+            case "${value#-}" in
+              ''|*[!0-9.]*) value="$qt$(printf '%s' "$value" | sed "s/$qt/\\\\$qt/g")$qt" ;;
+            esac
+            ;;
+        esac
+        out=$(render "$tdir/field.tpl" name="$name" value="$value" visibility="$vis" \
+          class="$cname" static="$st" prefix="$pre" js_name="$st$pre$name")
+        fbody=${fbody:+$fbody$NL}$out
+        reset
+        continue
+        ;;
+    esac
+    case "$tok" in
+      \**) gen='*'; tok=${tok#\*} ;;
+    esac
+    name=${tok%%(*}
+    params=${tok#"$name"}
+    params=${params#(}
+    params=$(vars "${params%)}" "$vt")
+    m=$mtpl
+    [ -n "$st" ] && [ -f "$tdir/static_method.tpl" ] && m=$tdir/static_method.tpl
+    out=$(render "$m" name="$name" params="$params" params_comma="${params:+, $params}" visibility="$vis" \
+      class="$cname" static="$st" async="$as" gen="$gen" prefix="$pre" js_name="$st$as$gen$pre$name")
+    body=${body:+$body$NL$NL}$out
+    reset
+  done <<EOT
+$(methods "$spec")
+EOT
+  [ -n "$fbody" ] && body=$fbody${body:+$NL$NL$body}
+  [ -z "$body" ] && body=$(tpl empty.tpl)
+  render "$ctpl" class="$cname" methods="$body" extends="$ext_str"
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    .|..|*/)
+      dir=${1%/}
+      mkdir -p "$dir"
+      shift
+      ;;
+    ?*.*)
+      file=$1
+      parent=
+      case "$file" in
+        *"|"*)
+          parent=${file#*|}
+          file=${file%%|*}
+          ;;
+      esac
+      spec=$2
+      shift
+      [ $# -gt 0 ] && shift
+      target="$dir/$file"
+      mkdir -p "$(dirname "$target")"
+      if [ -e "$target" ]; then
+        echo "skip (exists): $target" >&2
+        continue
+      fi
+      content=$(build "$file" "$spec" "$parent") || continue
+      if ( set -C; printf '%s\n' "$content" > "$target" ) 2>/dev/null; then
+        echo "created: $target"
+      else
+        echo "skip (exists): $target" >&2
+      fi
+      ;;
+    *)
+      dir=$1
+      mkdir -p "$dir"
+      shift
+      ;;
+  esac
+done
