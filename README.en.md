@@ -19,6 +19,9 @@ qcstub - a minimalist code structure generator for various programming languages
 Speeds up initial project design: instead of creating dozens of files by hand and typing keywords (`class`, `function`) in each of them, you can describe the project structure with a single command.
 It is also suitable for existing projects when you need to add several classes with methods at once.
 
+**Also useful for AI agents:**
+An agent describes the structure in one short command instead of emitting every file in full, which saves output tokens.
+
 > [!WARNING]
 > The project is under development. JavaScript, TypeScript and PHP are fully supported; templates for other languages may work incompletely.
 
