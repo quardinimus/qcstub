@@ -3,6 +3,9 @@ dir=.
 tpl_root=${XDG_CONFIG_HOME:-$HOME/.config}/qcstub/templates
 NL='
 '
+MARK='@@QCSTUB_METHODS@@'
+mode=new
+existing=
 
 AWK_LIB='
 BEGIN { for (k in ENVIRON) if (k ~ /^T_/) V[substr(k, 3)] = ENVIRON[k] }
@@ -94,6 +97,44 @@ reset() {
   gen=
 }
 
+has_member() {
+  [ -f "$1" ] || return 1
+  awk -v n="$2" -v k="$3" '
+    BEGIN { kw = " return await new yield throw else echo print case do elif if while for "; found = 0 }
+    {
+      l = $0
+      sub(/^[ \t]+/, "", l)
+      st = 1
+      while ((p = index(substr(l, st), n)) > 0) {
+        pos = st + p - 1
+        st = pos + 1
+        pre = substr(l, 1, pos - 1)
+        post = substr(l, pos + length(n))
+        if (substr(post, 1, 1) ~ /[A-Za-z0-9_]/) continue
+        if (pre ~ /\$$/) pre = substr(pre, 1, length(pre) - 1)
+        if (pre != "" && pre !~ /[ \t*&]$/) continue
+        if (pre ~ /[=(){};]/) continue
+        w = pre
+        sub(/[ \t]+$/, "", w)
+        if (split(w, a, /[ \t]+/) > 0 && index(kw, " " a[1] " ") > 0) continue
+        sub(/^[ \t]+/, "", post)
+        c = substr(post, 1, 1)
+        if (k == "m") {
+          if (c == "(" || w ~ /(^|[ \t])(def|fn|func|fun|function|sub|proc)$/) { found = 1; exit }
+        } else if (c == "=" || c == ";" || c == ":" || c == "," || c == "") { found = 1; exit }
+      }
+    }
+    END { exit !found }
+  ' "$1"
+}
+
+known() {
+  case "$seen" in *" $2:$1 "*) return 0 ;; esac
+  if [ -n "$existing" ] && has_member "$existing" "$1" "$2"; then return 0; fi
+  seen="$seen$2:$1 "
+  return 1
+}
+
 build() {
   file=$1
   spec=$2
@@ -118,6 +159,7 @@ build() {
     echo "no templates for .$ext in $tdir" >&2
     return 1
   fi
+  [ "$mode" = frame ] && spec=
   vt=$(tpl var.tpl '{{var}}')
   qt=$(tpl quote.tpl "'")
   nullv=$(tpl null.tpl null)
@@ -141,6 +183,7 @@ build() {
   fi
   body=
   fbody=
+  seen=' '
   reset
   while IFS= read -r tok; do
     [ -n "$tok" ] || continue
@@ -159,6 +202,11 @@ build() {
           continue
         fi
         name=${tok%%=*}
+        if known "$name" f; then
+          echo "skip (exists): $cname::$name" >&2
+          reset
+          continue
+        fi
         value=${tok#*=}
         case "$value" in ''|null) value=$nullv ;; esac
         case "$value" in
@@ -180,6 +228,11 @@ build() {
       \**) gen='*'; tok=${tok#\*} ;;
     esac
     name=${tok%%(*}
+    if known "$name" m; then
+      echo "skip (exists): $cname::$name" >&2
+      reset
+      continue
+    fi
     params=${tok#"$name"}
     params=${params#(}
     params=$(vars "${params%)}" "$vt")
@@ -193,8 +246,73 @@ build() {
 $(methods "$spec")
 EOT
   [ -n "$fbody" ] && body=$fbody${body:+$NL$NL$body}
-  [ -z "$body" ] && body=$(tpl empty.tpl)
+  case "$mode" in
+    add)
+      printf '%s' "$body"
+      return 0
+      ;;
+    frame) body=$MARK ;;
+    *) [ -z "$body" ] && body=$(tpl empty.tpl) ;;
+  esac
   render "$ctpl" class="$cname" methods="$body" extends="$ext_str"
+}
+
+merge() {
+  target=$1
+  mode=add
+  existing=$target
+  add=$(build "$2" "$3" "$4") || return
+  if [ -z "$add" ]; then
+    echo "skip (exists): $target" >&2
+    return
+  fi
+  mode=frame
+  existing=
+  frame=$(build "$2" "$3" "$4" 2>/dev/null) || return
+  tmp=$(mktemp) || return
+  FRAME=$frame ADD=$add MARK=$MARK awk '
+    BEGIN {
+      nf = split(ENVIRON["FRAME"], fl, "\n")
+      mark = ENVIRON["MARK"]
+      k = 0
+      for (i = 1; i <= nf; i++) if (index(fl[i], mark)) { k = i; break }
+      if (k == 0) exit 2
+      t = fl[k]
+      gsub(/^[ \t]+|[ \t]+$/, "", t)
+      if (t != mark) exit 2
+      np = nf - k
+      for (i = 1; i <= np; i++) { pl[i] = fl[k + i]; sub(/[ \t\r]+$/, "", pl[i]) }
+      head = ""
+      if (k > 1) { head = fl[k - 1]; sub(/[ \t\r]+$/, "", head) }
+    }
+    { line[++n] = $0 }
+    END {
+      while (n > 0 && line[n] ~ /^[ \t\r]*$/) n--
+      b = n - np
+      if (b < 0) exit 3
+      for (i = 1; i <= np; i++) {
+        t = line[b + i]
+        sub(/[ \t\r]+$/, "", t)
+        if (t != pl[i]) exit 3
+      }
+      for (i = 1; i <= b; i++) print line[i]
+      if (b > 0) {
+        last = line[b]
+        sub(/[ \t\r]+$/, "", last)
+        if (last != "" && !(k > 1 && last == head)) print ""
+      }
+      print ENVIRON["ADD"]
+      for (i = 1; i <= np; i++) print line[b + i]
+    }
+  ' "$target" > "$tmp"
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    cat "$tmp" > "$target"
+    echo "updated: $target"
+  else
+    echo "skip (cannot merge, structure differs): $target" >&2
+  fi
+  rm -f "$tmp"
 }
 
 while [ $# -gt 0 ]; do
@@ -219,9 +337,11 @@ while [ $# -gt 0 ]; do
       target="$dir/$file"
       mkdir -p "$(dirname "$target")"
       if [ -e "$target" ]; then
-        echo "skip (exists): $target" >&2
+        merge "$target" "$file" "$spec" "$parent"
         continue
       fi
+      mode=new
+      existing=
       content=$(build "$file" "$spec" "$parent") || continue
       if ( set -C; printf '%s\n' "$content" > "$target" ) 2>/dev/null; then
         echo "created: $target"
